@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 本文件只覆盖 H563 工程的**构建/烧录命令**与**代码地图**。硬件参数、PI 定档、调试结论、bring-up 进度一律以上级 `../CLAUDE.md`（motor_driver 项目总规则）为权威，两处冲突时以上级为准；进度日志写 `../任务进度.md`。固件版本以 main.c USER CODE 2 开头的横幅字符串为准（现行 step6b）。
+> 本文件只覆盖 H563 工程的**构建/烧录命令**与**代码地图**。硬件参数、PI 定档、调试结论、bring-up 进度一律以上级 `../CLAUDE.md`（motor_driver 项目总规则）为权威，两处冲突时以上级为准；进度日志写 `../任务进度.md`。固件版本以 main.c USER CODE 2 开头的横幅字符串为准（现行 step6f）。
 
 ## 构建
 
@@ -12,7 +12,7 @@ STM32CubeIDE 1.18.1 工程（CubeMX 生成，MCU=STM32H563RIT6，TrustZone=Disab
 - 日常构建走 IDE GUI（Project → Build），产物 `Debug/H563.elf`
 - **Debug 配置 = -O3**（2026-09-04 定档上板）；Release 配置 = -Os（未启用，勿拿它烧板对比性能）
 - 改 `.ioc` 后在 CubeMX 重新生成 → **Refresh + Clean + Rebuild**（曾因 Debug/ 旧 makefile 缺 Middlewares 路径报 FreeRTOS.h 找不到）
-- ⚠ `.ioc` 重生成必须保持 TIM1 Counter Period=**4167**（30kHz）——与 `Core/Inc/foc.h` 的 `TIMER_ARR` 强耦合，不同步则占空比超标 1.5 倍
+- ⚠ `.ioc` 重生成必须保持 TIM1 Counter Period=**4167**（30kHz）与 **RepetitionCounter=1**——Period 与 `Core/Inc/foc.h` 的 `TIMER_ARR` 强耦合（不同步则占空比超标 1.5 倍）；RCR=1 保证 UPDATE 每 PWM 周期恰一次（RCR=0 时中心对齐上下顶点双发，重挂追得上半周期就实跑 60kHz，09-05 定案）
 - ⚠ CubeMX 大改/挪引脚会抹掉引脚标签宏与上拉参数——重生成后核对 `main.h` 标签 + `gpio.c` 上拉（OSC32 脚 PC14/PC15 踩过）
 
 ## 烧录
@@ -36,20 +36,20 @@ CubeMX 生成文件（adc/spi/tim/usart/gpdma/gpio/icache.c、stm32h5xx_msp/time
 ### 30kHz 电流环数据流（跨文件主线）
 
 ```
-TIM1 中心对齐 ARR=4167 ──TRGO2=UPDATE（每 PWM 周期一次）──▶ ADC1 5ch 扫描（20.3µs）
+TIM1 中心对齐 ARR=4167 RCR=1 ──TRGO2=UPDATE（每 PWM 周期恰一次）──▶ ADC1 3ch 扫描（电流 6.5 拍=0.9µs 定稿——INA240 直连无 RC、源阻抗 Ω 级，短采样无建立之忧；NTC/PWR 09-05 迁 ADC2）
   → GPDMA1_CH0 One-Shot ──▶ GPDMA1_Channel0_IRQHandler（stm32h5xx_it.c：DWT 记 t0/dt）
   → HAL_ADC_ConvCpltCallback（main.c）：foc_run 时 FOC_CurrentLoop → svpwm → 写 TIM1 CCR
       ↳ 回调尾部重挂 HAL_ADC_Start_DMA（H5 One-Shot 块结束硬件清 ADSTART，重挂安全）
       ↳ 重挂后关 DMA_IT_HT（H5 HAL 无条件挂半传输回调，不关则中断翻倍）
 ```
 
-- **CCR 映射：CCR1→W(PA8) / CCR2→V(PA9) / CCR3→U(PA10)**（与 G431 相比 U/W 互换）；foc.c 的 CurrentLoop 与 ZeroAlign **两处**写 CCR 必须同映射，否则零点定义在反射坐标系里起环必发散
-- `adc_buf[0..4]` = Iu(PA0) / Iv(PA1) / Iw(PA2) / NTC(PA3) / PWR(PC5)
+- **CCR 映射：CCR1→W(PA8) / CCR2→V(PA9) / CCR3→U(PA10)**（与 G431 相比 U/W 互换）；foc.c 的 CurrentLoop / ZeroAlign(Open) / align_hold / StaticVectorProbe **四处**写 CCR 必须同映射，否则零点定义在反射坐标系里起环必发散
+- `adc_buf[0..2]` = Iu(PA0) / Iv(PA1) / Iw(PA2)；NTC(PA3)/PWR(PC5) 走 **ADC2 软件单发**——UartTXTask 50ms 拍里 `adc2_read()`（HAL_ADC_Start + 两次 PollForConversion，640.5 拍长采样保分压建立精度），与 30kHz 控制链零耦合
 - 角度链：开机 SPI 读一次 21-bit 绝对角播种 TIM2 CNT（ang>>5）→ 运行时只读 CNT（ABZ 16384 线 ×4 = 65536 cpr 恰满 16bit 回绕）；ABZ 计数方向与 SPI 角相反，由 `ENC_DIR=-1` 在软件消化
 
 ### main.c 点火链（USER CODE 2，调度器启动前，顺序不可换）
 
-横幅 → DWT CYCCNT 使能（LAR 解锁字直写 0xE0001FB0，CMSIS 5.6 无 LAR 成员）→ `DRV8320S_BringupTest()` → `HAL_Delay(200)` 等 MT6835 EEPROM→寄存器导入 → ABZ 影子写 0x007/0x008 → 播种 TIM2 → `FOC_Init` + ADC 校准 + `Start_DMA` + TIM1 起 → 零流校准 1000 均值（覆盖三相共模偏置）→ `FOC_ZeroAlign`（5V/1s，上电有抽动）→ `foc_run=1`。顺序关键点：首个 UPDATE 触发到来时 DMA 必须已就位。
+横幅 → DWT CYCCNT 使能（LAR 解锁字直写 0xE0001FB0，CMSIS 5.6 无 LAR 成员）→ `DRV8320S_BringupTest()` → `HAL_Delay(200)` 等 MT6835 EEPROM→寄存器导入 → ABZ 影子写 0x007/0x008 → 播种 TIM2 → `FOC_Init` + ADC 校准 + `Start_DMA` + TIM1 起 → 零流校准 1000 均值（覆盖三相共模偏置）→ `FOC_ZeroAlign`（v2 闭环双侧逼近，ALIGN_CURRENT_A 见 foc.h，~2.5s；开环 5V 版保留 foc.c 备用）→ `foc_run=1`。顺序关键点：首个 UPDATE 触发到来时 DMA 必须已就位。
 
 ### FreeRTOS 三任务（app_freertos.c）
 
@@ -62,10 +62,11 @@ TIM1 中心对齐 ARR=4167 ──TRGO2=UPDATE（每 PWM 周期一次）──▶
 | 命令 | 作用 |
 |---|---|
 | `q 数值` | 设 iq_ref，0.01A 定标（q 50=0.50A），限幅 ±10A |
-| `z` | 重对齐：停环 → 5V 锁 d 轴 → 复环（CSV 停 ~1s 属预期，电机抽一下） |
+| `z` | 重对齐：停环 → v2 闭环双侧逼近 → 复环（CSV 停 ~2.5s 属预期） |
 | `c` | 清零电角度周期计数（判 1:1 vs ÷8 跟踪速率） |
 | `v 0~359` | 静态矢量探针：2V 开环矢量 + 打印 cnt/iu/iv/iw/αβ 角（先 `q 0`） |
 | `t` | GPDMA0 ISR 耗时快照：t/max/avg µs + load% + 样本数 n |
+| `d` | id 直流项长窗均值：窗=8 机械圈（恰 7 个 K24 周期，零泄漏），旋转 ~3-5s 出数（静止 8s 超时，trav=0 可辨） |
 | `w` | 按需查 vbus（EMA 值）/ NTC 温度 |
 
 ## 编码约定（代码层）

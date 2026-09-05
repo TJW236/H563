@@ -25,7 +25,7 @@ volatile uint16_t shadow_cnt = 0;
 static volatile int32_t elec_accum = 0;  /* elec16 增量 int16 差分累计（16bit 定点）；
                                           * volatile：ISR 累加 + c 命令任务清零，跨上下文共享 */
 volatile int32_t shadow_elec_revs = 0;   /* 电角度走过周期数 = elec_accum/65536 */
-extern uint16_t adc_buf[5];              /* main.c：DMA 目标（foc_run=0 仍 30kHz 刷新） */
+extern uint16_t adc_buf[3];              /* main.c：DMA 目标（foc_run=0 仍 30kHz 刷新；NTC/PWR 09-05 迁 ADC2） */
 
 /* ==================== PI 控制器（照抄 G431） ==================== */
 
@@ -277,7 +277,10 @@ void FOC_ResetElecRevs(void)
 
 /* ==================== 零位对齐 ==================== */
 
-void FOC_ZeroAlign(FOC_t *foc)
+/* 开环 5V 单次对齐（备用路径；09-05 前默认 → 当日 v2 试用→回退→晚再启用 v2 验证）：
+ * 静止稳态电流=V/R≈11.4A（163% 额定），落点由静摩擦/齿槽"从哪侧逼近停哪格"决定
+ * → Δθ̄ 随上电位置抽奖（09-04 由 id_DC 反解 2~9° elec，幅度或偏大），id DC 项随之随机 */
+void FOC_ZeroAlignOpen(FOC_t *foc)
 {
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
@@ -307,6 +310,115 @@ void FOC_ZeroAlign(FOC_t *foc)
         HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)mlen, 20);
 
     HAL_Delay(500);   /* 保持通电稳定（G431 节奏 500+500ms） */
+}
+
+/* ---- v2：αβ 电流闭环 + 同目标双侧逼近取平均（当前默认，09-05 晚再启用）----
+ * 重复性已验证（dm/dp 诊断 <0.7°）；绝对精度验证中——判据=恒速 id_DC 回归 ≈0、
+ * 逐次上电不再抽奖。换回开环=main.c 点火链 + app_freertos.c z 命令两处调用。
+ * 电流环跑任务级 1kHz 阻塞环（照 StaticVectorProbe 模式）：foc_run=0 时 ISR 不写
+ * CCR、ADC DMA 仍 30kHz 刷新 adc_buf 为活数据。帧角=θ_cmd−90° 时该帧 q 轴恰指向
+ * θ_cmd，iq_ref=+I → 电流矢量落在 θ_cmd 方向，转子 d 轴吸到电流矢量（每电周期
+ * 单稳定点，θ_cmd+180° 为不稳定点）。kp/ki 沿用 ×2 档物理值（V/A、V/(A·s)），
+ * 与采样率无关：87Hz 环宽 @1kHz 采样 11 倍裕量，离散相位滞后后 PM≈43°，3A 阶跃
+ * 电流超调 ~25%（峰值 ~3.8A）。iα 开环不控：静止 ωe≈0 交叉
+ * 耦合 ωe·L→0，pi_id 当年炸环的 ωc≫ωe 条件在静止不成立 */
+static uint16_t align_hold(FOC_t *foc, uint16_t theta_cmd16, float amps,
+                           uint32_t hold_ms, PI_t *pi)
+{
+    uint16_t frame16 = theta_cmd16 - 16384u;    /* θ_cmd − 90° */
+    float theta_f = (float)frame16 * (TWO_PI / 65536.0f);
+    float sin_f = fast_sin(theta_f);
+    float cos_f = fast_cos(theta_f);
+
+    for (uint32_t t = 0; t < hold_ms; t++)
+    {
+        /* Clarke（照抄 CurrentLoop，含 i_zero 零流校准扣除） */
+        float iu = ((int16_t)adc_buf[0] - foc->i_zero[0]) * CURRENT_SCALE;
+        float iv = ((int16_t)adc_buf[1] - foc->i_zero[1]) * CURRENT_SCALE;
+        float ialpha = iu;
+        float ibeta = (iu + 2.0f * iv) / SQRT3;
+        float iq = -ialpha * sin_f + ibeta * cos_f;
+
+        float uq = PI_Calc(pi, amps - iq, 1);
+
+        float d_u, d_v, d_w;
+        svpwm(0.0f, uq, theta_f, foc->vbus, 0.9f, &d_u, &d_v, &d_w);
+        TIM1->CCR1 = (uint16_t)(d_w * TIMER_ARR);   /* CCR1→W/CCR2→V/CCR3→U，三处同映射 */
+        TIM1->CCR2 = (uint16_t)(d_v * TIMER_ARR);
+        TIM1->CCR3 = (uint16_t)(d_u * TIMER_ARR);
+        HAL_Delay(1);
+    }
+
+    /* 保持通电状态下读落点（松手后摩擦会移位）；e_raw 与运行环同账本：
+     * elec16 = cnt×PP×ENC_DIR + elec_offset16 */
+    uint16_t cnt = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+    return (uint16_t)((int32_t)cnt * (POLE_PAIRS * ENC_DIR));
+}
+
+/* 16bit 角差 → 0.01° 定标（诊断打印用；|d|≤32768 → 36000 倍不溢出 uint32） */
+static int align_deg100(int32_t d16)
+{
+    int neg = (d16 < 0);
+    uint32_t a = neg ? (uint32_t)(-d16) : (uint32_t)d16;
+    uint32_t c = a * 36000UL / 65536UL;
+    return neg ? -(int)c : (int)c;
+}
+
+void FOC_ZeroAlign(FOC_t *foc)
+{
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+
+    /* dt=1ms 任务环周期；max 与电流环同规格 vbus×0.7 */
+    PI_t pi;
+    PI_Init(&pi, 0.22f, 228.0f, foc->vbus * 0.7f, 0.001f);
+
+    uint16_t step16 = (uint16_t)(ALIGN_STEP_DEG * 65536u / 360u);
+
+    /* ① 0° 吸附：随机方向落位，仅作起点/诊断，不进均值 */
+    pi.integral1 = 0.0f;
+    uint16_t e_park = align_hold(foc, 0, ALIGN_CURRENT_A, ALIGN_SETTLE_MS, &pi);
+    /* ② +90° → ③ 回 0°（+侧逼近）读 ε₊ */
+    pi.integral1 = 0.0f;
+    align_hold(foc, step16, ALIGN_CURRENT_A, ALIGN_SETTLE_MS, &pi);
+    pi.integral1 = 0.0f;
+    uint16_t e_plus = align_hold(foc, 0, ALIGN_CURRENT_A, ALIGN_SETTLE_MS, &pi);
+    /* ④ −90° → ⑤ 回 0°（−侧逼近）读 ε₋ */
+    pi.integral1 = 0.0f;
+    align_hold(foc, (uint16_t)(0u - step16), ALIGN_CURRENT_A, ALIGN_SETTLE_MS, &pi);
+    pi.integral1 = 0.0f;
+    uint16_t e_minus = align_hold(foc, 0, ALIGN_CURRENT_A, ALIGN_SETTLE_MS, &pi);
+
+    /* 环形均值：两读数同目标，差=±2δ_f 小量，回绕安全。
+     * ε₊/ε₋ 中摩擦偏置反号 → 均值消除；残余=齿槽刚度项（固定小偏置非随机） */
+    int32_t dpm = (int32_t)(uint16_t)(e_plus - e_minus);
+    if (dpm > 32768) dpm -= 65536;
+    uint16_t e_mean = (uint16_t)(e_plus - dpm / 2);
+    int32_t dpk = (int32_t)(uint16_t)(e_park - e_mean);
+    if (dpk > 32768) dpk -= 65536;
+
+    /* ⑥ 电流缓降到 0：复环无电流阶跃；PI 积分不重置保持连续 */
+    for (int i = ALIGN_RAMP_MS; i >= 0; i--)
+        align_hold(foc, 0, ALIGN_CURRENT_A * (float)i / ALIGN_RAMP_MS, 1, &pi);
+
+    /* 落位 e_mean 处 elec16=0（与旧版同一本账：elec16 = cnt×PP×D + off） */
+    foc->elec_offset16 = (uint16_t)(-(int32_t)e_mean);
+    foc->prev_elec16 = 0;    /* 对齐点 elec16=0，差分起点同步 */
+    foc->omega_e = 0.0f;
+
+    /* 诊断：dm=ε₊−ε₋≈2δ_f 摩擦偏置（机理验证判据）；dp=随机落位 vs 均值
+     * （旧版单一读数的抽奖幅度）。负角小数位取绝对值防 "-3.-57" 坏格式 */
+    int dm = align_deg100(dpm), dp = align_deg100(dpk);
+    int dm_f = dm % 100; if (dm_f < 0) dm_f = -dm_f;
+    int dp_f = dp % 100; if (dp_f < 0) dp_f = -dp_f;
+    char msg[96];
+    int mlen = snprintf(msg, sizeof(msg),
+                        "[align] ep=%u em=%u dm=%d.%02d dp=%d.%02d off=%u\r\n",
+                        e_plus, e_minus, dm / 100, dm_f, dp / 100, dp_f,
+                        foc->elec_offset16);
+    if (mlen > 0)
+        HAL_UART_Transmit(&huart1, (uint8_t *)msg, (uint16_t)mlen, 20);
 }
 
 /* ==================== 静态矢量探针（v 命令，09-02 判别实验） ==================== */

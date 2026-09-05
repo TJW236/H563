@@ -20,9 +20,9 @@
                                  * 28.5V 挡母线误接高压（ADC 饱和读 29.7）与再生过冲 */
 
 /* PWR/NTC 换算（2026-09-05 原理图定值上线）：
- * PWR_ADC（adc_buf[4]）：24V 母线 1/9 分压（80k 上/10k 下）→
+ * PWR_ADC（ADC2 adc2_pwr，09-05 迁出 adc_buf）：24V 母线 1/9 分压（80k 上/10k 下）→
  *   vbus = code × 3.3/4096 × 9，表示上限 29.7V；UartTXTask 500ms EMA 平滑喂 g_foc.vbus
- * NTC_ADC（adc_buf[3]）：3.3V─10k─NTC─10k─GND，ADC 采 NTC 与下臂 10k 的中点 →
+ * NTC_ADC（ADC2 adc2_ntc）：3.3V─10k─NTC─10k─GND，ADC 采 NTC 与下臂 10k 的中点 →
  *   R_ntc = 10k×(4096/code − 2)；10kΩ/B=3950 标准 NTC，β 方程出温度。
  *   电压随温升单调升（0V 断路/极冷 → 1.65V 短路/极热），室温 ~22°C ≈ 码 1300
  *   （08-30 实测 1307 反解 22.2°C 吻合）；上下 10k 主导分压，B 取 3950 或 3435
@@ -48,15 +48,29 @@
 #define R_SHUNT         0.005f
 #define CURRENT_SCALE   (VREF / 4096.0f / INA_GAIN / R_SHUNT)
 
-/* 电流环 dt：环实跑 = PWM 频率（2026-08-31 实测 n=+5180/258ms——中心对齐 RCR=0 下
- * TRGO2=UPDATE 每 PWM 周期只发一次，"上下顶点各一次→40kHz" 旧推断作废）。
- * 2026-09-02 PWM 20k→30kHz：DT_LOOP=DT_CURRENT=33.34µs，dt·f=1.0 关系不变
- * （ki 不随 dt 缩放：PI_Calc 内 integral += error×dt，物理量独立于 dt） */
+/* 电流环 dt：环实跑 = PWM 频率（09-05 RCR=1 定案）。中心对齐 RCR=0 下 UPDATE 上下顶点
+ * 每半周期各发一次：旧 5ch/247.5 拍/-O0 时重挂追不上半周期 → 第二触发静默丢拍 →
+ * 实测恰=PWM 频率（08-31 n=+5180/258ms 曾误记"每周期只发一次"，系丢拍假象）；09-05 序列
+ * 瘦 3ch + -O3 后重挂 ~8µs 追上 16.67µs 半周期 → 实跑翻倍 60kHz（守卫 got=2×exp 抓出）。
+ * RCR=1：UPDATE 每两极点一次 = 每周期恰一次，30kHz 恢复；两极点均零矢量中心，采哪个都有效。
+ * DT_LOOP=DT_CURRENT=33.34µs；ki 不随 dt 缩放（PI_Calc 内 integral += error×dt，
+ * 物理量独立于 dt；60kHz 期间积分曾等效 ki×2，09-05 当日旋转数据注意此污染） */
 #define DT_LOOP         (2.0f * TIMER_ARR / 250000000.0f)          /* 实际回调周期 33.34µs（ωe 差分用） */
 #define DT_CURRENT      (2.0f * TIMER_ARR / 250000000.0f)          /* PI 参数域 33.34µs */
 
 /* 电流滑动平均（照抄 G431） */
 #define CURRENT_AVG_SIZE 3
+
+/* 零点对齐 v2（2026-09-05）：αβ 电流闭环 + 同目标双侧逼近取平均。
+ * 动机：id_DC=(ωe·ψf/R)·sin(Δθ̄)，Δθ̄=开环 5V 对齐落点（静摩擦+齿槽抽奖，
+ * 实测 2~9° 随上电位置）；同目标双侧逼近使摩擦偏置反号相消 */
+#define ALIGN_CURRENT_A   5.0f    /* 对齐电流（09-05 7A→5A→3A 咔哒声逐档降。⚠ 物理方向：
+                                   * δ_f 与齿槽残差均 ∝1/I，降电流对 id 直流项是反向操作，
+                                   * 此处仅为声学；3A 力矩 0.40N·m 对摩擦+齿槽 0.05~0.24N·m
+                                   * 余量 1.7~8×，2A 贴边勿再降） */
+#define ALIGN_STEP_DEG    90      /* 双侧拉偏角（电角度） */
+#define ALIGN_SETTLE_MS   400     /* 每步保持时长（含吸附摆动衰减） */
+#define ALIGN_RAMP_MS     200     /* 收尾电流缓降时长 */
 
 /* PI 控制器（照抄 G431 7-31 定稿） */
 typedef struct {
@@ -117,7 +131,8 @@ extern FOC_t g_foc;
 
 void FOC_Init(FOC_t *foc);
 void FOC_CurrentLoop(FOC_t *foc, uint16_t *adc_buf);
-void FOC_ZeroAlign(FOC_t *foc);
+void FOC_ZeroAlign(FOC_t *foc);             /* v2 闭环双侧逼近（当前默认：09-05 晚再启用验证绝对精度） */
+void FOC_ZeroAlignOpen(FOC_t *foc);         /* 开环 5V 单次对齐（备用路径） */
 void FOC_ResetElecRevs(void);             /* 清零电角度周期计数（串口 c 命令） */
 void FOC_StaticVectorProbe(float volts, uint16_t elec_deg); /* 静态矢量探针（v 命令，判输出/输入侧镜像） */
 

@@ -53,7 +53,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint16_t adc_buf[5];                 /* DMA 目标：0=Iu(PA0) 1=Iv(PA1) 2=Iw(PA2) 3=NTC(PA3) 4=PWR(PC5)（09-01 数据证伪换序说，维持原序） */
+uint16_t adc_buf[3];                 /* DMA 目标：0=Iu(PA0) 1=Iv(PA1) 2=Iw(PA2)（09-01 数据证伪换序说，维持原序）；
+                                       * NTC/PWR 09-05 迁 ADC2（PA3/PC5），任务侧 adc2_read 软件单发，不在本序列 */
 volatile uint32_t adc_scan_cnt = 0;  /* ConvCplt 累计：实跑 30kHz，速率守卫 500ms 间隔期望 ≈+15000 */
 volatile uint8_t adc_cal_state = 0;  /* 1=零流校准中（回调只累加不跑环） */
 volatile uint16_t cal_n = 0;
@@ -133,8 +134,9 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_SPI2_Init();
+  MX_ADC2_Init();
   /* USER CODE BEGIN 2 */
-  static const char banner[] = "\r\n=== H563 step6b: PWM PA8W PA9V PA10U, ADC 0U 1V 2W, ENC_DIR=-1, loop 30kHz, pi 0.22/228 (x2), vbus/ntc live, iq_ref=0 ===\r\n";
+  static const char banner[] = "\r\n=== H563 step6f: rcr1=update 1/pwm-period (30kHz true), adc1 3ch i6.5 + adc2 ntc/pwr, ENC_DIR=-1, pi 0.22/228 (x2), align v2 5A, vbus/ntc live, iq_ref=0 ===\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)banner, sizeof(banner) - 1, 100);
 
   /* DWT CYCCNT 使能（测量 GPDMA0 ISR 耗时，t 命令读数）：Cortex-M33 调试单元
@@ -246,7 +248,8 @@ int main(void)
   FOC_Init(&g_foc);
   adc_cal_state = 1;
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buf, 5);
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);  /* NTC/PWR 通道：无 DMA 无触发，任务侧软件单发 */
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buf, 3);
   HAL_TIM_Base_Start(&htim1);
 
   /* 零流校准：PWM 未启动（INH 低）、电机静止 → 三相累加 1000 次取平均，
@@ -264,7 +267,8 @@ int main(void)
       HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
   }
 
-  /* 零点对齐：5V 矢量锁 d 轴 → 电角度零点（⚠ 上电电机会有一次对齐抽动） */
+  /* 零点对齐：v2 闭环双侧逼近（09-05 晚再启用做绝对精度验证——重复性 dm/dp<0.7°
+   * 已过，本次判据=恒速 id_DC 回归 ≈0 且逐次上电不再抽奖；开环版保留 foc.c 备用） */
   FOC_ZeroAlign(&g_foc);
 
   /* 起环：回调从此跑 FOC_CurrentLoop；iq_ref 写死 0，输出≈0，电机自由 */
@@ -398,7 +402,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
       FOC_CurrentLoop(&g_foc, adc_buf);
     }
     adc_scan_cnt++;
-    HAL_ADC_Start_DMA(hadc, (uint32_t *)adc_buf, 5);
+    HAL_ADC_Start_DMA(hadc, (uint32_t *)adc_buf, 3);
     /* 关 HT 中断（2026-09-03 t 命令实测抓出）：H5 的 HAL_ADC_Start_DMA 无条件挂半传输
      * 回调 → Start_IT 开 HTIE → 每 ADC 周期两次 GPDMA 中断（HT ~1.0µs 只跑空弱函数，
      * 白耗 3% CPU 且污染 t 读数）。Start_DMA 每次重挂都重开 HTIE，故每次都关 */

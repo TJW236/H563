@@ -48,7 +48,8 @@ void MX_TIM1_Init(void)
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
   htim1.Init.Period = 4167;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.RepetitionCounter = 1;   /* UPDATE 每 2 个极点一次 = 每 PWM 周期恰一次（09-05：RCR=0 时上下顶点双发，
+                                        * 3ch+-O3 下重挂追上半周期 → 实跑翻倍 60kHz；RCR=1 回 30kHz。与 .ioc 必须同步 */
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
   {
