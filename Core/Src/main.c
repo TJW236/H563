@@ -1,0 +1,526 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os2.h"
+#include "adc.h"
+#include "gpdma.h"
+#include "icache.h"
+#include "spi.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include "mt6835.h"
+#include "drv8320s.h"
+#include "foc.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+uint16_t adc_buf[5];                 /* DMA 目标：0=Iu(PA0) 1=Iv(PA1) 2=Iw(PA2) 3=NTC(PA3) 4=PWR(PC5)（09-01 数据证伪换序说，维持原序） */
+volatile uint32_t adc_scan_cnt = 0;  /* ConvCplt 累计：实跑 30kHz，速率守卫 500ms 间隔期望 ≈+15000 */
+volatile uint8_t adc_cal_state = 0;  /* 1=零流校准中（回调只累加不跑环） */
+volatile uint16_t cal_n = 0;
+volatile uint32_t cal_sum[3] = {0, 0, 0};
+volatile uint8_t foc_run = 0;        /* 1=电流环运行（对齐完成后置位） */
+volatile uint8_t uart_rx_byte;       /* UART 命令接收（照抄 G431）：单字节 RX 目标 */
+volatile char uart_cmd_buf[32];      /* 行缓冲：ISR 逐字节写，任务解析后清 */
+volatile uint8_t uart_cmd_idx = 0;
+volatile uint8_t uart_cmd_ready = 0; /* 1=\n/\r 收到完整一行，待任务解析 */
+/* GPDMA0 ISR 耗时统计（DWT CYCCNT，stm32h5xx_it.c 写入，t 命令快照后清零）：
+ * last/max/avg 单位 = CPU 周期（250MHz → 4ns/LSB）；sum 用 64 位——
+ * 30kHz×~5000 周期 ≈ 1.5亿/s，uint32 约 28s 回绕，慢按 t 会出垃圾 avg */
+volatile uint32_t foc_dt_last = 0;
+volatile uint32_t foc_dt_max = 0;
+volatile uint64_t foc_dt_sum = 0;
+volatile uint32_t foc_dt_n = 0;
+extern DMA_HandleTypeDef handle_GPDMA1_Channel0;  /* adc.c：ConvCplt 回调关 HT 中断用 */
+#if 0 /* v6 拖动自校准遗留（随 USER CODE 2 内 #if 0 块一起恢复） */
+static const char *cal_name[4] = { "none", "busy", "FAIL", "OK" };
+#endif
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+void PeriphCommonClock_Config(void);
+static void MPU_Config(void);
+void MX_FREERTOS_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* MPU Configuration--------------------------------------------------------*/
+  MPU_Config();
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_GPDMA1_Init();
+  MX_ICACHE_Init();
+  MX_USART1_UART_Init();
+  MX_SPI1_Init();
+  MX_ADC1_Init();
+  MX_TIM1_Init();
+  MX_TIM2_Init();
+  MX_SPI2_Init();
+  /* USER CODE BEGIN 2 */
+  static const char banner[] = "\r\n=== H563 step6b: PWM PA8W PA9V PA10U, ADC 0U 1V 2W, ENC_DIR=-1, loop 30kHz, pi 0.22/228 (x2), vbus/ntc live, iq_ref=0 ===\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t *)banner, sizeof(banner) - 1, 100);
+
+  /* DWT CYCCNT 使能（测量 GPDMA0 ISR 耗时，t 命令读数）：Cortex-M33 调试单元
+   * 自由运行周期计数器，无需调试器连接，TRCENA 使能即计数；若读数恒 0
+   * （t 命令自诊断）则该芯片需调试器激活，兜底换 TIM3 空闲计数器 */
+  DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
+  /* DWT 软件锁解锁字：CMSIS 5.6 的 DWT_Type 未定义 LAR 成员（仅 ITM 有），
+   * 硬件寄存器在 DWT 基址+0xFB0=0xE0001FB0，直写地址；未上锁/无此锁则空操作 */
+  *(volatile uint32_t *)0xE0001FB0UL = 0xC5ACCE55UL;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* DRV8320S：使能 + Mode1 读写诊断 + 写 G431 定稿四值（3x PWM/死区 100ns/OCP）。
+   * 使能保持高——后续对齐与电流环需要；PWM 未启动期间 INH 全低=低侧导通，
+   * 电机静止时无电流 */
+  DRV8320S_BringupTest();
+
+  /* 等 MT6835 EEPROM→寄存器导入完成（2026-08-28 实测：过早写影子寄存器会被导入覆盖） */
+  HAL_Delay(200);
+
+#if 0 /* ---- 拖动自校准 v6 全套停用（根因=⌀6 磁铁不足，待 ⌀10×2.5 径向到货重跑；
+       * 完整备份=H563_v6_dragcal_20260829.elf 直接重烧即可，恢复源码时连同
+       * app_freertos.c 的 mon 结构与两个任务体一起启用）----
+  static const char banner_v6[] = "\r\n=== H563 drag-cal v6: gear4 200-400rpm, gate 310-330 ===\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t *)banner_v6, sizeof(banner_v6) - 1, 100);
+
+  // 阶段1：单字节读自检
+  {
+     char buf[96];
+     uint8_t r0d = MT6835_ReadReg(0x00D);
+     uint8_t r0e = MT6835_ReadReg(0x00E);
+     uint8_t r07 = MT6835_ReadReg(0x007);
+     uint8_t r08 = MT6835_ReadReg(0x008);
+     int len = snprintf(buf, sizeof(buf),
+         "[single] 0x00D=%02X(exp07) 0x00E=%02X STD:03 | ABZ 0x007=%02X 0x008=%02X (STD:00,00 M5F:27,04)\r\n",
+         r0d, r0e, r07, r08);
+     if (len > 0)
+       HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)len, 20);
+   }
+
+  // 自校准档位 → 0x4（EEPROM 已固化，此块通常零写入）
+  {
+     uint8_t r0e = MT6835_ReadReg(0x00E);
+     if ((r0e & 0x70) == 0x40)
+     {
+       char b[64];
+       int len = snprintf(b, sizeof(b), "[gear] 0x00E=%02X (200-400) - already set\r\n", r0e);
+       if (len > 0)
+         HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
+     }
+     else
+     {
+       MT6835_WriteReg(0x00E, (uint8_t)((r0e & 0x8F) | 0x40));
+       uint8_t v0e = MT6835_ReadReg(0x00E);
+       char b[96];
+       int len = snprintf(b, sizeof(b), "[gear] AUTOCAL 0x00E %02X->%02X (shadow only, no burn)\r\n",
+                          r0e, v0e);
+       if (len > 0)
+         HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
+     }
+   }
+
+  // 对拖自校准：读 0x113 校准状态，bits[7:6]：00 无 / 01 忙 / 10 失败 / 11 成功 */
+   {
+     uint8_t r113 = MT6835_ReadReg(0x113);
+     uint8_t cal_st = (r113 >> 6) & 3u;
+     char b[64];
+     int len = snprintf(b, sizeof(b), "[cal] 0x113=%02X st=%u (%s)\r\n",
+                        r113, cal_st, cal_name[cal_st]);
+     if (len > 0)
+       HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
+   }
+
+  // CAL_EN 由 SpeedObserveTask 门控触发（|rpm|∈[310,330] 连续 400ms），初始电平低
+  ---- v6 end ---- */
+#endif
+
+  /* ABZ 分辨率 → 16384 线（影子寄存器，断电复原免烧 EEPROM）：
+   * 0x007=0xFF、0x008=0xFC → ×4 = 65536 cpr 恰满 16bit 一圈回绕 */
+  {
+    uint8_t r07 = MT6835_ReadReg(0x007);
+    uint8_t r08 = MT6835_ReadReg(0x008);
+    if (r07 != 0xFF) MT6835_WriteReg(0x007, 0xFF);
+    if (r08 != 0xFC) MT6835_WriteReg(0x008, 0xFC);
+    r07 = MT6835_ReadReg(0x007);
+    r08 = MT6835_ReadReg(0x008);
+    char b[64];
+    int len = snprintf(b, sizeof(b), "[abz] 0x007=%02X 0x008=%02X (target FF/FC)\r\n", r07, r08);
+    if (len > 0)
+      HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
+  }
+
+  /* SPI 读一次 21-bit 绝对角 → 播种 TIM2 编码器 CNT（ang>>5 映射 0..65535；
+   * ABZ 计数方向与 SPI 角相反——仅打印观察不影响，正式控制时软件取反） */
+  {
+    uint32_t ang; uint8_t st, crc;
+    MT6835_ReadAngle(&ang, &st, &crc);
+    HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+    __HAL_TIM_SET_COUNTER(&htim2, (uint16_t)(ang >> 5));
+    char b[64];
+    int len = snprintf(b, sizeof(b), "[seed] ang=%lu st=%u -> cnt=%u\r\n",
+                       (unsigned long)ang, st, (unsigned)__HAL_TIM_GET_COUNTER(&htim2));
+    if (len > 0)
+      HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
+  }
+
+  /* ADC 点火链：校准 → 挂 DMA → 最后开 TIM1（TRGO2=UPDATE 每 PWM 周期一次
+   * → 实跑 30kHz=PWM 频率，08-31 实测、09-02 提档）。顺序不可换：首个触发到来时 DMA 必须已就位 */
+  FOC_Init(&g_foc);
+  adc_cal_state = 1;
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buf, 5);
+  HAL_TIM_Base_Start(&htim1);
+
+  /* 零流校准：PWM 未启动（INH 低）、电机静止 → 三相累加 1000 次取平均，
+   * 覆盖 step5 实测的 -7 LSB 共模偏置（ADC 失调+REF 中点+GND 域差） */
+  while (cal_n < 1000) {}
+  adc_cal_state = 0;
+  g_foc.i_zero[0] = (int16_t)(cal_sum[0] / cal_n);
+  g_foc.i_zero[1] = (int16_t)(cal_sum[1] / cal_n);
+  g_foc.i_zero[2] = (int16_t)(cal_sum[2] / cal_n);
+  {
+    char b[80];
+    int len = snprintf(b, sizeof(b), "[zcal] n=%u zero=%d %d %d\r\n", cal_n,
+                       g_foc.i_zero[0], g_foc.i_zero[1], g_foc.i_zero[2]);
+    if (len > 0)
+      HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
+  }
+
+  /* 零点对齐：5V 矢量锁 d 轴 → 电角度零点（⚠ 上电电机会有一次对齐抽动） */
+  FOC_ZeroAlign(&g_foc);
+
+  /* 起环：回调从此跑 FOC_CurrentLoop；iq_ref 写死 0，输出≈0，电机自由 */
+  foc_run = 1;
+  {
+    static const char msg[] = "[foc] RUN iq_ref=0\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, sizeof(msg) - 1, 20);
+  }
+  /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+  /* Call init function for freertos objects (in app_freertos.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* 调度器已接管，此处永不执行：监控逻辑全部移入 app_freertos.c 的任务 */
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI
+                              |RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLL1_SOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 2;
+  RCC_OscInitStruct.PLL.PLLN = 40;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 3;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1_VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1_VCORANGE_WIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 0;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
+                              |RCC_CLOCKTYPE_PCLK3;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the programming delay
+  */
+  __HAL_FLASH_SET_PROGRAM_DELAY(FLASH_PROGRAMMING_DELAY_2);
+}
+
+/**
+  * @brief Peripherals Common Clock Configuration
+  * @retval None
+  */
+void PeriphCommonClock_Config(void)
+{
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+
+  /** Initializes the peripherals clock
+  */
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_CKPER;
+  PeriphClkInitStruct.CkperClockSelection = RCC_CLKPSOURCE_HSI;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+/* ADC 序列完成（GPDMA1_CH0 中断，实跑 30kHz）：零流校准累加 / 电流环 / 重挂 One-Shot DMA。
+ * H5 HAL 实证（stm32h5xx_hal_adc.c:3704）：DMACFG=0 时 DMA 块传输结束硬件停转换
+ * （ADSTART 自动清零），重入 HAL_ADC_Start_DMA 不会被"转换进行中"挡成 BUSY，
+ * ADC_Enable 对已使能 ADC 是空操作——与 G431 参考工程同模式。
+ * 对齐期间（cal_state=0 且 foc_run=0）只重挂不写 CCR，对齐矢量保持不动 */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
+    if (adc_cal_state)
+    {
+      cal_sum[0] += adc_buf[0];
+      cal_sum[1] += adc_buf[1];
+      cal_sum[2] += adc_buf[2];
+      cal_n++;
+    }
+    else if (foc_run)
+    {
+      FOC_CurrentLoop(&g_foc, adc_buf);
+    }
+    adc_scan_cnt++;
+    HAL_ADC_Start_DMA(hadc, (uint32_t *)adc_buf, 5);
+    /* 关 HT 中断（2026-09-03 t 命令实测抓出）：H5 的 HAL_ADC_Start_DMA 无条件挂半传输
+     * 回调 → Start_IT 开 HTIE → 每 ADC 周期两次 GPDMA 中断（HT ~1.0µs 只跑空弱函数，
+     * 白耗 3% CPU 且污染 t 读数）。Start_DMA 每次重挂都重开 HTIE，故每次都关 */
+    __HAL_DMA_DISABLE_IT(&handle_GPDMA1_Channel0, DMA_IT_HT);
+  }
+}
+
+/* UART 命令接收（照抄 G431 main.c：单字节中断收→行缓冲，\n/\r 收尾置 ready，
+ * 任务侧（UartTXTask）解析后清 idx/ready 并重挂在此） */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    uint8_t ch = uart_rx_byte;
+    if (ch == '\n' || ch == '\r')
+    {
+      if (uart_cmd_idx > 0)
+        uart_cmd_ready = 1;
+    }
+    else
+    {
+      if (uart_cmd_idx < sizeof(uart_cmd_buf) - 1)
+        uart_cmd_buf[uart_cmd_idx++] = (char)ch;
+    }
+    HAL_UART_Receive_IT(&huart1, (uint8_t *)&uart_rx_byte, 1);
+  }
+}
+
+/* ORE 溢出不清接收会永久卡死——G431 教训，兜底清标志重挂 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    HAL_UART_Receive_IT(huart, (uint8_t *)&uart_rx_byte, 1);
+  }
+}
+/* USER CODE END 4 */
+
+ /* MPU Configuration */
+
+void MPU_Config(void)
+{
+  MPU_Region_InitTypeDef MPU_InitStruct = {0};
+  MPU_Attributes_InitTypeDef MPU_AttributesInit = {0};
+
+  /* Disables the MPU */
+  HAL_MPU_Disable();
+
+  /** Initializes and configures the Region 0 and the memory to be protected
+  */
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+  MPU_InitStruct.BaseAddress = 0x08FFF000;
+  MPU_InitStruct.LimitAddress = 0x08FFFFFF;
+  MPU_InitStruct.AttributesIndex = MPU_ATTRIBUTES_NUMBER0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_ALL_RO;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
+  /** Initializes and configures the Attribute 0 and the memory to be protected
+  */
+  MPU_AttributesInit.Number = MPU_ATTRIBUTES_NUMBER0;
+  MPU_AttributesInit.Attributes = INNER_OUTER(MPU_NOT_CACHEABLE);
+
+  HAL_MPU_ConfigMemoryAttributes(&MPU_AttributesInit);
+  /* Enables the MPU */
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM7 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM7)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
