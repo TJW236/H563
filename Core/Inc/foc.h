@@ -11,6 +11,7 @@
 
 /* 硬件参数（8108 电机 + H563 驱动板） */
 #define POLE_PAIRS      21
+#define KT_NATIVE       0.134f   /* 电机轴力矩常数 N·m/A（8108 手册 0.94N·m/7A；输出轴等效 ×8=1.072） */
 #define TIMER_ARR       4167    /* TIM1 中心对齐 PSC=0：PWM = 250M/(4167×2) ≈ 30kHz（09-02 由 20k
                                 * 提档；250M/60k 除不尽取 4167，DT 宏随之自洽，与 tim.c Period 必须同步） */
 #define VBUS_DEFAULT    24.0f   /* 初值：对齐在调度器启动前完成，第一帧 PWR 实测到来前不能是 0 */
@@ -22,17 +23,24 @@
 /* PWR/NTC 换算（2026-09-05 原理图定值上线）：
  * PWR_ADC（ADC2 adc2_pwr，09-05 迁出 adc_buf）：24V 母线 1/9 分压（80k 上/10k 下）→
  *   vbus = code × 3.3/4096 × 9，表示上限 29.7V；UartTXTask 500ms EMA 平滑喂 g_foc.vbus
- * NTC_ADC（ADC2 adc2_ntc）：3.3V─10k─NTC─10k─GND，ADC 采 NTC 与下臂 10k 的中点 →
- *   R_ntc = 10k×(4096/code − 2)；10kΩ/B=3950 标准 NTC，β 方程出温度。
- *   电压随温升单调升（0V 断路/极冷 → 1.65V 短路/极热），室温 ~22°C ≈ 码 1300
- *   （08-30 实测 1307 反解 22.2°C 吻合）；上下 10k 主导分压，B 取 3950 或 3435
- *   在 80°C 档差异仅 ~1.7% 码——NTC 型号不准也不碍事 */
+ * NTC_ADC（ADC2 adc2_ntc，2026-09-05 晚拔线实测改并联拓扑）：板上
+ *   3.3V─10k─●─10k─GND 纯分压，电机 NTC（10k/B3950，贴定子绕组）从节点 ● 并联
+ *   到地：R_eff=10k∥R_ntc → R_ntc = 10k×code/(4096−2×code)，β 方程出温度。
+ *   旧串联式（4096/code−2）方向解反——温升码降被读成降温（"转起来反而变冷"之谜，
+ *   实为绕组 32~34°C 被读成 16°C）；锚点：NTC 万用表 7.3kΩ ↔ 码 1215 反解 7.29k。
+ *   拔线=码 ~2048 → 读极冷；短路=码→0 → 读极热。NTC 引线随电机线束与相线并行，
+ *   PWM 耦合 ±400 count 单帧双向毛刺 → adc2_read 内 3 帧中值滤波后入 adc2_ntc；
+ *   B 取 3950/3435 在 80°C 档差异仅 ~1.7% 码，型号不准不碍事 */
 #define PWR_DIV_RATIO   9.0f
 #define NTC_R_FIXED     10000.0f  /* 上、下臂各 10kΩ */
 #define NTC_R25         10000.0f
 #define NTC_BETA        3950.0f
 #define NTC_T25_K       298.15f
-#define NTC_WARN_C      80.0f     /* 超温报警阈值（功率级），只打印不动作 */
+#define NTC_WARN_C      80.0f     /* 二次报警阈值：70°C 跳闸后仍爬到此值=外来热源或 NTC 短路 */
+#define NTC_TRIP_C      70.0f     /* 过温跳闸：iq_ref 强制 0 + 拒绝 q/s/z/v（09-05 加，任务级） */
+#define NTC_REL_C       60.0f     /* 跳闸自动解除阈值（迟滞 10°C，防 70°C 边界断续出力极限环） */
+#define NTC_OPEN_C      (-30.0f)  /* 低于此值=NTC 开路（拔线读 ~-77°C，绕组物理不可能）：
+                                   * 锁扣跳闸且不自动解除，插回线也不恢复，断电才复位 */
 
 /* 电角度方向 = ABZ 计数方向 × ENC_DIR，必须与 U→V→W 相序同向。
  * 08-27 交叉审计实测 ABZ 与 SPI 绝对角相反（仪器级）；09-01 手拧判得 +1 系误判
@@ -57,6 +65,28 @@
  * 物理量独立于 dt；60kHz 期间积分曾等效 ki×2，09-05 当日旋转数据注意此污染） */
 #define DT_LOOP         (2.0f * TIMER_ARR / 250000000.0f)          /* 实际回调周期 33.34µs（ωe 差分用） */
 #define DT_CURRENT      (2.0f * TIMER_ARR / 250000000.0f)          /* PI 参数域 33.34µs */
+
+/* 速度环 dt：TIM3 独立时基 4285.4Hz（PSC=0/ARR=58337=8334×7−1，与 TIM1 同 8334 节拍
+ * 粒度 → 环比恰=电流环 1/7 整数分频无相位漂移；250M/58338=4285.37Hz；NVIC 优先级 6
+ * 低于 GPDMA0 的 5 → 电流环永远可抢占速度环）。SPEED_TIM_ARR 与 tim.c 的 Period
+ * 强耦合——同 TIMER_ARR 纪律：.ioc 重生成必须保持 58337，改一处必同步另一处 */
+#define SPEED_TIM_ARR       58337
+#define DT_SPEED            ((SPEED_TIM_ARR + 1) / 250000000.0f)   /* 233.4µs */
+
+/* 测速换算：TIM2 CNT 65536 cpr 的 233.4µs 差分 → 电机轴 RPM（1 count=3.92 RPM，
+ * 30RPM≈7.6 count/拍；输出轴=电机轴/8）。符号约定见 FOC_SpeedLoop */
+#define SPEED_SCALE         (60.0f / 65536.0f / DT_SPEED)
+#define SPEED_FILTER_ALPHA  0.14f   /* 一阶低通 ≈95Hz @4285Hz（09-08 随频率自 0.15 校准，α·fs 恒定）：压 ±1count 差分抖动（±3.9RPM） */
+
+/* 位置环（2026-09-10 实现，设计=09-09 定案）：位置 PI 跑 TIM3 内 ÷4（4285/4≈1071Hz）
+ * → speed_target（限幅 ±800=G431 值，09-10 拍板）→ 现有速度环零改动。
+ * 里程表 total_cnt：int32，TIM3 233.4µs 拍累加 int16 差分（回绕免疫），±21 亿 count=
+ * ±4096 输出圈永不溢出；零点=上电播种位置（main.c 在对齐之前记 boot_cnt，对齐挪动量
+ * 经初值入表）。误差域=电机轴 rad（G431 kp=54 原值直拷）；p 命令输出轴 rad 入口 ×8——
+ * 若误差改在输出轴域算，等效 kp=54×8=432，混域差 8 倍 */
+#define POS_DIV             4
+#define POS_SPEED_LIMIT     800.0f
+#define GEAR_RATIO          8.0f    /* 减速比：电机轴 rad = 输出轴 rad × 8 */
 
 /* 电流滑动平均（照抄 G431） */
 #define CURRENT_AVG_SIZE 3
@@ -103,9 +133,39 @@ extern volatile uint16_t shadow_theta16;  /* 16bit 定点电角度（×360/65536
 extern volatile uint16_t shadow_cnt;      /* TIM2 CNT 快照（65536 cpr 机械角） */
 extern volatile int32_t shadow_elec_revs; /* 电角度走过周期数（09-02 判别 1:1 vs ÷8） */
 
-/* FOC 状态（本版仅电流环；速度/位置环随三环移植并入此结构体） */
+/* 速度环跨上下文变量（TIM3 4kHz ISR 与 UART 任务共享，单字对齐 float/uint8 原子） */
+extern volatile uint8_t speed_mode;    /* 1=速度模式（s 命令进）0=力矩模式（q 命令回） */
+extern volatile float speed_target;    /* 目标转速（电机轴 RPM；±880 限幅在命令侧，09-05 解禁） */
+extern volatile float shadow_speed;    /* 滤波后转速 RPM（ISR 写，CSV/诊断读） */
+
+/* 位置环跨上下文变量（任务写 p 命令，TIM3 ISR 读写；单字对齐原子） */
+extern volatile uint8_t pos_mode;      /* 1=位置模式（p 命令进）0=退（q/s 命令、OTP 跳闸） */
+extern volatile float pos_target;      /* 目标位置（电机轴 rad；p 命令输出轴 rad ×8 入） */
+extern volatile int32_t total_cnt;     /* 里程表（TIM3 ISR 写，任务读/CSV；32 位对齐读原子） */
+
+/* 重力前馈（2026-09-14 补丁，实验台摆锤负载）：τ=m·g·L·sin(θ_out) 为输出轴角的
+ * 确定性函数（重力负载.docx 实证 iq=0.14+1.33·sin(pos)，R²=0.995），开环给出主项、
+ * 速度 PI 只修残差（±15RPM 纹波→K24 底）。只在 speed_mode 域内叠加（s/p 生效；
+ * q 力矩模式不加——不污染带宽/探针类实验；OTP 跳闸随 speed_mode=0 一并停）。
+ * ⚠ 相位零点=上电悬底位：开前馈前确认上电时摆自由悬停，扶摆上电则相位错。
+ * grav_on=0 时 FOC_SpeedLoop 前馈分支不执行，三环行为与旧版逐位一致 */
+extern volatile uint8_t grav_on;      /* 1=开启（g 命令）；上电默认 0 */
+extern volatile float grav_amp;       /* 前馈幅度（A）= m·l·9.8/(GEAR_RATIO×KT_NATIVE)，命令侧换算 */
+float FOC_GravityFF(void);            /* 本拍前馈电流（无状态：相位实时取 total_cnt） */
+
+/* 一圈输出轴的里程表 count 数（65536×8=2^19）。int32 溢出点 2^31=4096×2^19 恰为
+ * 其整数倍 → 相位跨溢出连续，单向连转 4096 输出圈无需任何处理 */
+#define GRAV_CNT_PER_OUT_REV  (65536L * 8L)
+
+/* FOC 状态（电流环+速度环已入；位置环随移植并入） */
 typedef struct {
     PI_t pi_iq;             /* 电流环 PI（跟踪 iq_ref） */
+    PI_t pi_speed;          /* 速度环 PI（起步 0.017，09-08 定案 0.034/0.035/7.5A/233.4µs） */
+    PI_t pi_pos;            /* 位置环 PI（09-10：kp=54 G431 直拷，ki=0 纯 P，max=±800RPM） */
+    uint8_t pos_div;        /* 位置环 ÷4 分频计数（4285/4≈1071Hz） */
+
+    uint16_t prev_cnt;     /* 速度差分用上一拍 TIM2 CNT */
+    float speed_rpm_filt;  /* 一阶滤波转速（速度 PI 反馈量，shadow_speed 的源） */
 
     float iq_filtered;      /* Iq 低通滤波后的值（送入电流 PI） */
     float iq_filter_alpha;  /* Iq 滤波系数（越大响应越快，纹波也越多） */
@@ -131,6 +191,7 @@ extern FOC_t g_foc;
 
 void FOC_Init(FOC_t *foc);
 void FOC_CurrentLoop(FOC_t *foc, uint16_t *adc_buf);
+void FOC_SpeedLoop(FOC_t *foc);             /* TIM3 4kHz：测速 + 速度 PI → shadow_iq_ref */
 void FOC_ZeroAlign(FOC_t *foc);             /* v2 闭环双侧逼近（当前默认：09-05 晚再启用验证绝对精度） */
 void FOC_ZeroAlignOpen(FOC_t *foc);         /* 开环 5V 单次对齐（备用路径） */
 void FOC_ResetElecRevs(void);             /* 清零电角度周期计数（串口 c 命令） */

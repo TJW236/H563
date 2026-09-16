@@ -135,8 +135,9 @@ int main(void)
   MX_TIM2_Init();
   MX_SPI2_Init();
   MX_ADC2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  static const char banner[] = "\r\n=== H563 step6f: rcr1=update 1/pwm-period (30kHz true), adc1 3ch i6.5 + adc2 ntc/pwr, ENC_DIR=-1, pi 0.22/228 (x2), align v2 5A, vbus/ntc live, iq_ref=0 ===\r\n";
+  static const char banner[] = "\r\n=== H563 step9: pos loop (tim3/4 1071hz, pi 54/0 max800rpm, cmd p=OutShaftRad, csv col9/10=pos mrad); speed 0.034/0.035@4285hz; base: rcr1 30kHz, pi_iq 0.22/228, ENC_DIR=-1; ntc otp70 ===\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)banner, sizeof(banner) - 1, 100);
 
   /* DWT CYCCNT 使能（测量 GPDMA0 ISR 耗时，t 命令读数）：Cortex-M33 调试单元
@@ -231,11 +232,13 @@ int main(void)
 
   /* SPI 读一次 21-bit 绝对角 → 播种 TIM2 编码器 CNT（ang>>5 映射 0..65535；
    * ABZ 计数方向与 SPI 角相反——仅打印观察不影响，正式控制时软件取反） */
+  uint16_t boot_cnt = 0;   /* 位置环零点=上电播种位置：必须在对齐之前记（09-09 设计） */
   {
     uint32_t ang; uint8_t st, crc;
     MT6835_ReadAngle(&ang, &st, &crc);
     HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
     __HAL_TIM_SET_COUNTER(&htim2, (uint16_t)(ang >> 5));
+    boot_cnt = (uint16_t)(ang >> 5);
     char b[64];
     int len = snprintf(b, sizeof(b), "[seed] ang=%lu st=%u -> cnt=%u\r\n",
                        (unsigned long)ang, st, (unsigned)__HAL_TIM_GET_COUNTER(&htim2));
@@ -277,6 +280,21 @@ int main(void)
     static const char msg[] = "[foc] RUN iq_ref=0\r\n";
     HAL_UART_Transmit(&huart1, (uint8_t *)msg, sizeof(msg) - 1, 20);
   }
+
+  /* 位置环里程表初始化（零点=上电播种位置）：total_cnt 初值=(int16)(CNT−boot_cnt)，
+   * 对齐拽转子的挪动量经初值入表；prev_cnt 同步重挂——FOC_Init 的锁存点在对齐之前，
+   * 不重挂则 TIM3 首拍差分含对齐位移，与初值双计（里程表出生带 ~17° 电机角误差），
+   * 且首拍速度读数含对齐阶跃。TIM3 未启动，无竞态 */
+  {
+    uint16_t c_now = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+    total_cnt = (int16_t)(c_now - boot_cnt);
+    g_foc.prev_cnt = c_now;
+  }
+
+  /* 速度环时基：TIM3 4285Hz 中断（NVIC 优先级 6，低于 GPDMA0 的 5 → 电流环永远可
+   * 抢占速度环；速度 PI 另有 speed_mode && foc_run 双门控）。放对齐之后：
+   * 对齐搬转子的差分阶跃不会进滤波器 */
+  HAL_TIM_Base_Start_IT(&htim3);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -494,7 +512,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     HAL_IncTick();
   }
   /* USER CODE BEGIN Callback 1 */
-
+  if (htim->Instance == TIM3)
+      FOC_SpeedLoop(&g_foc);   /* 4285Hz 速度环：测速+速度 PI→shadow_iq_ref（速度模式时） */
   /* USER CODE END Callback 1 */
 }
 

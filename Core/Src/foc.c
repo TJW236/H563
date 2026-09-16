@@ -26,6 +26,21 @@ static volatile int32_t elec_accum = 0;  /* elec16 增量 int16 差分累计（1
                                           * volatile：ISR 累加 + c 命令任务清零，跨上下文共享 */
 volatile int32_t shadow_elec_revs = 0;   /* 电角度走过周期数 = elec_accum/65536 */
 extern uint16_t adc_buf[3];              /* main.c：DMA 目标（foc_run=0 仍 30kHz 刷新；NTC/PWR 09-05 迁 ADC2） */
+extern volatile uint8_t foc_run;         /* main.c：速度 PI 门控（对齐/探针期间不调节） */
+
+/* 速度环跨上下文变量（任务写 s/q 命令，TIM3 ISR 读写） */
+volatile uint8_t speed_mode = 0;
+volatile float speed_target = 0.0f;
+volatile float shadow_speed = 0.0f;
+
+/* 位置环跨上下文变量（任务写 p 命令，TIM3 ISR 读写） */
+volatile uint8_t pos_mode = 0;
+volatile float pos_target = 0.0f;
+volatile int32_t total_cnt = 0;   /* 里程表：零点=上电播种位置（main.c 对齐前初始化） */
+
+/* 重力前馈（2026-09-14 补丁）：摆锤负载实验台参数，任务写（m/l/g 命令）、TIM3 ISR 读 */
+volatile uint8_t grav_on = 0;
+volatile float grav_amp = 0.0f;
 
 /* ==================== PI 控制器（照抄 G431） ==================== */
 
@@ -160,6 +175,9 @@ void FOC_Init(FOC_t *foc)
     foc->iw_avg_sum = 0.0f;
     foc->avg_idx = 0;
 
+    foc->prev_cnt = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);  /* 编码器已启动（点火链在前） */
+    foc->speed_rpm_filt = 0.0f;
+
     shadow_iq_ref = 0.0f;   /* 本版写死 0：上电对齐后电机自由，无输出 */
 
     /* 带宽 09-04 晚矩阵定档 ×2：kp/L = 0.22/403µ → ωc≈546 rad/s≈87Hz。
@@ -168,6 +186,18 @@ void FOC_Init(FOC_t *foc)
      * 全抑制档，且 440RPM 全程稳（史上最高速）；id 波 0.20~0.27A/100RPM 与带宽
      * 无关（d 轴开环，纯被控对象属性）；ki/kp 保持 ≈R/L 零极点对消 */
     PI_Init(&foc->pi_iq, 0.22f, 228.0f, VBUS_DEFAULT * 0.7f, DT_CURRENT);
+
+    /* 速度环（09-05 移植，G431 7-31 起步值 0.017；09-08 调参定案 kp=0.034）/ki=0.035/max=7.5A，
+     * dt=TIM3 233.4µs。ki 不随 dt 缩放（PI_Calc 内 integral+=error×dt，物理量制）。
+     * 调参用串口 k/i 命令（直接浮点值），CSV 第 7/8 列看跟踪 */
+    PI_Init(&foc->pi_speed, 0.034f, 0.035f, 7.5f, DT_SPEED);
+
+    /* 位置环（09-10 实现）：kp=54 G431 直拷，ki=0 纯 P——PI_Calc 第三参数传 0 关积分
+     *（开着的话 integral 无界增长，最终 0×inf=NaN 灌进 speed_target）；max=±800RPM
+     * =速度限幅（09-10 拍板取 G431 值 800 非 880）；dt=4 拍（÷4 分频，ki=0 未用到，
+     * 为将来加 ki 备）。integral_limit=max/0=+inf，该字段无读者，无害 */
+    PI_Init(&foc->pi_pos, 54.0f, 0.0f, POS_SPEED_LIMIT, POS_DIV * DT_SPEED);
+    foc->pos_div = 0;
 }
 
 /* ==================== FOC 电流环（ADC DMA 回调调用，实跑 30kHz=PWM 频率） ==================== */
@@ -273,6 +303,73 @@ void FOC_ResetElecRevs(void)
 {
     elec_accum = 0;
     shadow_elec_revs = 0;
+}
+
+/* ==================== 速度环（TIM3 4kHz 中断调用） ==================== */
+
+/* 测速 + 速度 PI → shadow_iq_ref。力矩模式（speed_mode=0）下只测速不调节：
+ * CSV 速度列始终有效，q 测试/对齐后也能看转速。
+ *
+ * 转速符号约定：与 iq 同号——正 iq 的驱动方向记为正转速。链路：正 iq →
+ * 转子朝 theta_e 增大方向转（FOC 定向正确的前提）；theta_e = cnt×PP×ENC_DIR+off
+ * 中 ENC_DIR=-1 → theta_e 增大 = CNT 减小 → rpm = Δcnt × ENC_DIR × 定标。
+ * 上板判据（先开环后闭环，防镜面翻车）：q 20（+0.2A）空转时 CSV 第 8 列应 >0；
+ * 若 <0 则此符号错，翻 ENC_DIR 因子即可（一处）。
+ * 已知无害瑕疵：z 重对齐/v 探针搬动转子后第一拍差分是阶跃（±90°elec≈780cnt），
+ * 滤波后 ~50ms 衰减，CSV 最多一帧毛刺。
+ *
+ * 位置环（09-10）同函数承载：total_cnt 里程表逐拍累加（z/v/对齐搬转子经差分自动
+ * 入表，物理位移不失账）；位置 P 跑 ÷4 拍（≈1071Hz）输出 speed_target，速度 PI
+ * 随后同拍消费——级联顺序天然保证 */
+void FOC_SpeedLoop(FOC_t *foc)
+{
+    uint16_t cnt = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+    int16_t diff = (int16_t)(cnt - foc->prev_cnt);   /* int16 差分回绕安全（同 elec_accum） */
+    foc->prev_cnt = cnt;
+
+    total_cnt += diff;   /* 里程表（位置环） */
+
+    float rpm = (float)diff * ENC_DIR * SPEED_SCALE;
+    foc->speed_rpm_filt += SPEED_FILTER_ALPHA * (rpm - foc->speed_rpm_filt);
+    shadow_speed = foc->speed_rpm_filt;
+
+    /* 位置环 ÷4：误差域=电机轴 rad（pos_target 已在 p 命令入口 ×8）；纯 P 输出=
+     * 速度指令（±800 由 PI max 限幅），写 speed_target 喂下面速度 PI（speed_mode
+     * 由 p 命令置 1）。enable_integrate=0：ki=0 下防积分无界（见 FOC_Init 注释） */
+    foc->pos_div++;
+    if (foc->pos_div >= POS_DIV)
+    {
+        foc->pos_div = 0;
+        if (pos_mode && foc_run)
+        {
+            float pos = (float)total_cnt * ENC_DIR * (TWO_PI / 65536.0f);
+            speed_target = PI_Calc(&foc->pi_pos, pos_target - pos, 0);
+        }
+    }
+
+    if (speed_mode && foc_run)
+    {
+        float iq_cmd = PI_Calc(&foc->pi_speed, speed_target - foc->speed_rpm_filt, 1);
+        if (grav_on)   /* 重力前馈（09-14 补丁）：关=本分支不执行，此处与旧版行为一致 */
+            iq_cmd += FOC_GravityFF();
+        shadow_iq_ref = iq_cmd;   /* 单次 volatile 写：PI+前馈合一，电流环不会抢占读到中间值 */
+    }
+}
+
+/* ==================== 重力前馈（2026-09-14 补丁，实验台摆锤负载） ==================== */
+
+/* iq_ff = grav_amp × sin(θ_out)。相位实时取里程表（无状态：开关任意时机、中途启停
+ * 都无陈旧相位可错）：r = total_cnt % 2^19 → ×ENC_DIR → 规约 [0, 2^19) → ×2π/2^19
+ * → fast_sin（输入恒 [0,2π) 正角，走 09-04 掩码快路径）。全程小整数运算：
+ * r < 2^19 乘 ±1 无溢出；C 负数 % 为负须 +N 兜底；float 只在最后小数角度出现
+ * （2^19 < 2^24，转换精确）。实证标定（重力负载.docx，1kg×0.145m 摆）：
+ * iq = 0.14 + 1.33·sin(pos)——摩擦 0.14A 慢残差由速度积分器吸收 */
+float FOC_GravityFF(void)
+{
+    int32_t r = total_cnt % GRAV_CNT_PER_OUT_REV;
+    int32_t phase = ((r * ENC_DIR) % GRAV_CNT_PER_OUT_REV + GRAV_CNT_PER_OUT_REV)
+                    % GRAV_CNT_PER_OUT_REV;
+    return grav_amp * fast_sin((float)phase * (TWO_PI / (float)GRAV_CNT_PER_OUT_REV));
 }
 
 /* ==================== 零位对齐 ==================== */

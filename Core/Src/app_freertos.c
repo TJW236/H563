@@ -49,7 +49,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-static uint16_t adc2_ntc = 0, adc2_pwr = 0;  /* ADC2 软件单发结果（09-05 迁移）：NTC/PWR 原始码 */
+static uint16_t adc2_ntc = 0, adc2_pwr = 0;  /* ADC2 软件单发结果（09-05 迁移）：NTC 3 帧中值后码 / PWR 原始码 */
 extern volatile uint32_t adc_scan_cnt;     /* main.c：ConvCplt 累计（30kHz） */
 extern volatile uint8_t uart_rx_byte;      /* main.c：UART 命令接收（照抄 G431） */
 extern volatile uint8_t uart_cmd_ready;
@@ -176,12 +176,23 @@ void StartTask02(void *argument)
   /* USER CODE BEGIN UartTXTask */
   /* 唯一的 UART 发送者（09-01 改版）：VOFA+ FireWater 图表流，50ms 一帧纯 CSV（09-04 降频：
    * CSV 判的是跟踪误差/id 漂移包络/转速稳定度等慢量，20Hz 采样够用，数据量降 60%）：
-   *   iq×100, 目标iq_ref×100, id×100, 电角度0~359°, 电角度周期计数(09-02加), NTC×10 °C(09-05加)
+   *   iq×100, 目标iq_ref×100, id×100, 电角度0~359°, 电角度周期计数(09-02加), NTC×10 °C(09-05加),
+   *   速度目标×1 RPM(09-05加), 滤波转速×1 RPM(09-05加),
+   *   位置目标/实测 mRad 输出轴(09-10加) —— 共 10 列
    * 电流 0.01A 定标（50=0.50A）；FireWater 把行内所有数字当采样点，故正常时
    * 只发 CSV、不发任何带数字的文本行。用 int 不用 int32_t：newlib 上 int32_t=long。
    *
    * 命令（行协议照抄 G431：字母+空格+数值+\n，中断侧行缓冲，此处轮询解析）：
-   *   q 数值  设 iq_ref，0.01A 定标（q 50=0.50A，q 0 归零），限幅 ±10A
+   *   q 数值  设 iq_ref，0.01A 定标（q 50=0.50A，q 0 归零），限幅 ±10A；
+   *           同时退速度/位置模式回力矩模式（speed_mode=pos_mode=0）
+   *   s 数值  速度目标（电机轴 RPM，限 ±880=额定点，09-05 由 300 解禁；兜底三层：
+   *           PI±7.5A / SVPWM 0.8 限幅 / NTC 70°C 跳闸）：进速度模式（位置模式退场）。
+   *           bumpless：速度 PI 积分预置当前 iq_ref，接管无电流阶跃（09-05）
+   *   p 数值  位置目标（输出轴 rad，09-10 加）：×8 入电机轴误差域后进位置模式。
+   *           级联=位置 P（1071Hz）→ speed_target ±800 限幅 → 现有速度环；
+   *           bumpless 同 s。零点=上电时刻位置（里程表，对齐挪动量入表；
+   *           45° mod 原理限制：断电搬动零点差整数个 45°——摆好再上电）
+   *   k / i   速度环 kp / ki（直接浮点值，如 k 0.034 / i 0.035；即时生效，CSV 看跟踪）
    *   z       重对齐：停环→v2 闭环双侧逼近→复环（CSV 停 ~2.5s 属预期；
    *           09-05 晚随绝对精度验证切回 v2，开环版保留 foc.c）
    *   c       清零电角度周期计数（第 5 列，判 1:1 vs ÷8 跟踪速率用）
@@ -193,11 +204,16 @@ void StartTask02(void *argument)
    *   d       id 直流项长窗均值：窗=8 机械圈（恰 7 个 K24 波周期，泄漏精确为 0），
    *           1ms 采样，旋转 ~3-5s 出数（CSV 暂停同 v/z；静止 8s 超时兜底 trav=0）
    *   w       按需查询母线电压/NTC 温度（09-05 上线；正常静默防污染 CSV，
-   *           超温 80°C 另有 [ntc] 报警行） */
+   *           超温 80°C 另有 [ntc] 报警行）
+   * 过温跳闸（09-05 晚）：NTC ≥70°C 或开路（< -30°C）→ iq_ref 强制 0 + 拒绝 q/s/z/v；
+   * 过温降回 60°C 自动解除（解除后不出力，须重新下发命令）；开路锁存断电才复位 */
   HAL_UART_Receive_IT(&huart1, (uint8_t *)&uart_rx_byte, 1);  /* NVIC 已由 usart.c 使能 */
   uint8_t div = 0;
   uint32_t rate_prev_tick = 0, rate_prev_scan = 0;   /* ADC 速率守卫基准（首轮只记录） */
   uint8_t rate_armed = 0;
+  uint8_t ntc_trip = 0;   /* 过温跳闸锁扣：1=iq_ref 已强制 0 且 q/s/z/v 被拒（50ms 拍判温） */
+  uint8_t ntc_open = 0;   /* NTC 开路锁存（读 < -30°C）：不复位不解除，断电才恢复 */
+  float grav_m = 0.0f, grav_l = 0.0f;   /* 重力前馈参数：负载质量 kg / 力臂 m（m、l 命令写） */
   for(;;)
   {
     if (uart_cmd_ready)
@@ -234,18 +250,82 @@ void StartTask02(void *argument)
       int elen = 0;
       if (uart_cmd_buf[0] == 'q')
       {
-        float a = val * 0.01f;
-        if (a > 10.0f) a = 10.0f;
-        if (a < -10.0f) a = -10.0f;
-        shadow_iq_ref = a;
-        elen = snprintf(ebuf, sizeof(ebuf), "q=%d\r\n", (int)(a * 100.0f));
+        if (ntc_trip)   /* 跳闸期间拒绝出力命令，保护绕不过 */
+        {
+          elen = snprintf(ebuf, sizeof(ebuf), "[ntc] trip - q blocked\r\n");
+        }
+        else
+        {
+          float a = val * 0.01f;
+          if (a > 10.0f) a = 10.0f;
+          if (a < -10.0f) a = -10.0f;
+          speed_mode = 0;          /* q = 力矩模式：速度 PI 停写 shadow_iq_ref（先停后写防竞态） */
+          pos_mode = 0;            /* 同时退位置模式：位置 P 停写 speed_target */
+          shadow_iq_ref = a;
+          elen = snprintf(ebuf, sizeof(ebuf), "q=%d\r\n", (int)(a * 100.0f));
+        }
+      }
+      else if (uart_cmd_buf[0] == 's')
+      {
+        if (ntc_trip)
+        {
+          elen = snprintf(ebuf, sizeof(ebuf), "[ntc] trip - s blocked\r\n");
+        }
+        else
+        {
+          /* 速度模式：目标限幅后进 PI；积分预置当前 iq_ref = bumpless 接管
+           *（当前 0A 时仅 kp×err 起步 0.5A 级，无阶跃） */
+          if (val > 880.0f) val = 880.0f;   /* 09-05 由 300 解禁至额定点；兜底=PI±7.5A+SVPWM 0.8 限幅+NTC 70°C 跳闸 */
+          if (val < -880.0f) val = -880.0f;
+          g_foc.pi_speed.integral1 = shadow_iq_ref;
+          speed_target = val;
+          speed_mode = 1;
+          pos_mode = 0;            /* s = 手动速度模式：位置 P 退场 */
+          elen = snprintf(ebuf, sizeof(ebuf), "s=%d rpm\r\n", (int)val);
+        }
+      }
+      else if (uart_cmd_buf[0] == 'p')
+      {
+        if (ntc_trip)
+        {
+          elen = snprintf(ebuf, sizeof(ebuf), "[ntc] trip - p blocked\r\n");
+        }
+        else
+        {
+          /* 位置模式：目标输出轴 rad → ×8 入电机轴误差域（kp=54 G431 直拷的前提，
+           * 混域等效差 8 倍）；speed_mode 必须同置 1（位置环经速度环出力）。
+           * bumpless 同 s：速度 PI 积分预置当前 iq_ref，接管无电流阶跃。
+           * 大步进=位置 P 饱和 ±800 恒速 slew；到位纯 P 保持（有限刚度，G431 同款） */
+          g_foc.pi_speed.integral1 = shadow_iq_ref;
+          pos_target = val * GEAR_RATIO;
+          pos_mode = 1;
+          speed_mode = 1;
+          elen = snprintf(ebuf, sizeof(ebuf), "p=%d mrad(out)\r\n", (int)(val * 1000.0f));
+        }
+      }
+      else if (uart_cmd_buf[0] == 'k')
+      {
+        g_foc.pi_speed.kp = val;   /* 任务写/ISR 读：单字对齐 float 原子 */
+        elen = snprintf(ebuf, sizeof(ebuf), "skp=%d(x1000)\r\n", (int)(val * 1000.0f));
+      }
+      else if (uart_cmd_buf[0] == 'i')
+      {
+        g_foc.pi_speed.ki = val;
+        elen = snprintf(ebuf, sizeof(ebuf), "ski=%d(x1000)\r\n", (int)(val * 1000.0f));
       }
       else if (uart_cmd_buf[0] == 'z')
       {
-        foc_run = 0;
-        FOC_ZeroAlign(&g_foc);   /* v2 闭环重对齐：双侧逼近+电流缓降，阻塞本任务 ~2.5s */
-        foc_run = 1;
-        elen = snprintf(ebuf, sizeof(ebuf), "z re-aligned\r\n");
+        if (ntc_trip)   /* 对齐电流 5A 同样发热，跳闸期间一并拒绝 */
+        {
+          elen = snprintf(ebuf, sizeof(ebuf), "[ntc] trip - z blocked\r\n");
+        }
+        else
+        {
+          foc_run = 0;
+          FOC_ZeroAlign(&g_foc);   /* v2 闭环重对齐：双侧逼近+电流缓降，阻塞本任务 ~2.5s */
+          foc_run = 1;
+          elen = snprintf(ebuf, sizeof(ebuf), "z re-aligned\r\n");
+        }
       }
       else if (uart_cmd_buf[0] == 'c')
       {
@@ -264,13 +344,20 @@ void StartTask02(void *argument)
       }
       else if (uart_cmd_buf[0] == 'v')
       {
-        int deg = (int)val;
-        while (deg < 0) deg += 360;
-        deg %= 360;
-        foc_run = 0;                       /* 先停环：CCR 无人覆写，矢量才锁得住 */
-        FOC_StaticVectorProbe(2.0f, (uint16_t)deg);  /* 内含 1.2s 保持+采样，CSV 停 ~1.5s 属预期 */
-        foc_run = 1;
-        elen = snprintf(ebuf, sizeof(ebuf), "v done\r\n");
+        if (ntc_trip)   /* 探针 2V 静态矢量 ≈4.5A，跳闸期间一并拒绝 */
+        {
+          elen = snprintf(ebuf, sizeof(ebuf), "[ntc] trip - v blocked\r\n");
+        }
+        else
+        {
+          int deg = (int)val;
+          while (deg < 0) deg += 360;
+          deg %= 360;
+          foc_run = 0;                       /* 先停环：CCR 无人覆写，矢量才锁得住 */
+          FOC_StaticVectorProbe(2.0f, (uint16_t)deg);  /* 内含 1.2s 保持+采样，CSV 停 ~1.5s 属预期 */
+          foc_run = 1;
+          elen = snprintf(ebuf, sizeof(ebuf), "v done\r\n");
+        }
       }
       else if (uart_cmd_buf[0] == 't')
       {
@@ -325,6 +412,29 @@ void StartTask02(void *argument)
                         (int)(shadow_iq_ref * 100.0f),
                         (unsigned long)n, (long)trav);
       }
+      else if (uart_cmd_buf[0] == 'm')   /* 重力前馈：负载质量 kg（如 m 1.0） */
+      {
+        grav_m = val;
+        grav_amp = grav_m * grav_l * 9.8f / (GEAR_RATIO * KT_NATIVE);
+        elen = snprintf(ebuf, sizeof(ebuf), "[grav] m=%dg l=%dmm ff=%dcA g=%d\r\n",
+                        (int)(grav_m * 1000.0f), (int)(grav_l * 1000.0f),
+                        (int)(grav_amp * 100.0f), grav_on);
+      }
+      else if (uart_cmd_buf[0] == 'l')   /* 重力前馈：力臂 m（如 l 0.145） */
+      {
+        grav_l = val;
+        grav_amp = grav_m * grav_l * 9.8f / (GEAR_RATIO * KT_NATIVE);
+        elen = snprintf(ebuf, sizeof(ebuf), "[grav] m=%dg l=%dmm ff=%dcA g=%d\r\n",
+                        (int)(grav_m * 1000.0f), (int)(grav_l * 1000.0f),
+                        (int)(grav_amp * 100.0f), grav_on);
+      }
+      else if (uart_cmd_buf[0] == 'g')   /* 重力前馈开关：g 1 开 / g 0 关（上电默认关；
+                                         * ⚠ 开前确认上电时摆自由悬底，否则相位错 */
+      {
+        grav_on = (val > 0.5f) ? 1 : 0;
+        elen = snprintf(ebuf, sizeof(ebuf), "[grav] %s ff=%dcA\r\n",
+                        grav_on ? "on" : "off", (int)(grav_amp * 100.0f));
+      }
       if (elen > 0)
         HAL_UART_Transmit(&huart1, (uint8_t *)ebuf, (uint16_t)elen, 10);
 
@@ -334,14 +444,54 @@ void StartTask02(void *argument)
 
     osDelay(50);   /* CSV 帧+命令轮询共用此周期：命令响应最坏 50ms，无感 */
     adc2_read();   /* ADC2 软件单发（~21µs 阻塞）：NTC/PWR 慢量专用，与 30kHz 控制链零耦合 */
-    char buf[64];
+
+    /* 过温跳闸（09-05 晚）：NTC ≥70°C 或开路（< -30°C 物理不可能，拔线读 ~-77°C）
+     * → 强制 iq_ref=0——先退速度模式再清 0（次序同 q 命令，防速度 PI 每拍复写）。
+     * 纯过温路降回 60°C 自动解除（迟滞防边界断续出力极限环），解除后力矩保持 0，须
+     * 重新下发命令才出力；短路读极热→≥70°C 路跳闸。开路/短路两失效方向均 fail-safe。
+     * 动作最坏延迟 ~200ms（50ms 拍+中值窗），对分钟级热过程绰绰有余 */
+    float t_ntc = ntc_to_celsius(adc2_ntc);
+    if (!ntc_open && t_ntc < NTC_OPEN_C)   /* 开路只锁一次；若并入自动解除条件会
+                                            * -77°C<60°C 每拍反复跳/解刷屏 */
+    {
+      ntc_open = 1;
+      static const char omsg[] = "[ntc] FAULT open\r\n";
+      HAL_UART_Transmit(&huart1, (uint8_t *)omsg, sizeof(omsg) - 1, 20);
+    }
+    if (!ntc_trip && (ntc_open || t_ntc >= NTC_TRIP_C))
+    {
+      ntc_trip = 1;
+      speed_mode = 0;
+      pos_mode = 0;       /* 位置模式一并退出（位置 P 不得复写 speed_target） */
+      shadow_iq_ref = 0.0f;
+      char tbuf[44];
+      int tl = snprintf(tbuf, sizeof(tbuf), "[ntc] TRIP %dC iq=0\r\n", (int)t_ntc);
+      if (tl > 0)
+        HAL_UART_Transmit(&huart1, (uint8_t *)tbuf, (uint16_t)tl, 20);
+    }
+    else if (ntc_trip && !ntc_open && t_ntc < NTC_REL_C)
+    {
+      ntc_trip = 0;
+      static const char relmsg[] = "[ntc] released\r\n";
+      HAL_UART_Transmit(&huart1, (uint8_t *)relmsg, sizeof(relmsg) - 1, 20);
+    }
+
+    char buf[80];
     int iq_c = (int)(shadow_iq * 100.0f);
     int tgt_c = (int)(shadow_iq_ref * 100.0f);
     int id_c = (int)(shadow_id * 100.0f);
     int th = (int)((uint32_t)shadow_theta16 * 360UL / 65536UL);
-    int ntc_c = (int)(ntc_to_celsius(adc2_ntc) * 10.0f);   /* 0.1°C 定标；单帧原始码 ±2LSB ≈ ±0.5°C 抖动属正常 */
-    int len = snprintf(buf, sizeof(buf), "%d,%d,%d,%d,%d,%d\n",
-                       iq_c, tgt_c, id_c, th, (int)shadow_elec_revs, ntc_c);
+    int ntc_c = (int)(t_ntc * 10.0f);   /* 0.1°C 定标；中值滤波后残余抖动属正常 */
+    /* 第 9/10 列：位置目标/实测（输出轴 mRad）。pos_target 是电机轴 rad → /8 回输出轴；
+     * 实测与 ISR 同账本：total_cnt×ENC_DIR×2π/65536/8。非位置模式下第 9 列保留上次
+     * 目标（同第 7 列语义）；total_cnt 是里程表连续量，断电重记零点 */
+    int pref_c = (int)(pos_target * (1000.0f / GEAR_RATIO));
+    int pact_c = (int)((float)total_cnt * ENC_DIR
+                       * (TWO_PI / 65536.0f / GEAR_RATIO) * 1000.0f);
+    int len = snprintf(buf, sizeof(buf), "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                       iq_c, tgt_c, id_c, th, (int)shadow_elec_revs, ntc_c,
+                       (int)speed_target, (int)shadow_speed,   /* 第7/8列：速度目标/实测 RPM（×1） */
+                       pref_c, pact_c);
     if (len > 0)
       HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)len, 20);
     /* DRV 健康巡检 ~500ms（10 帧）一次：仅故障态才打印（nFAULT 低或 FSR 非零），
@@ -429,13 +579,17 @@ void StartTask03(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-/* NTC 码 → 温度°C：R = 10k×(4096/code−2) → β 方程（NTC_* 定值见 foc.h）。
- * code 下限钳 1：NTC 断路（极冷）时读数趋向 −90°C，一眼可辨 */
+/* NTC 码 → 温度°C（2026-09-05 晚拔线实测改并联拓扑）：板上 3.3V─10k─●─10k─GND
+ * 纯分压，电机 NTC 从节点 ● 并联到地 → R_ntc = 10k×code/(4096−2×code)，β 方程出温
+ * （NTC_* 定值见 foc.h）。旧串联式 4096/code−2 方向解反：温升码降被读成降温。
+ * 实测锚点：NTC 万用表 7.3kΩ(32.5°C) ↔ 码 1215 反解 7.29k 分毫不差。
+ * 失效签名：拔线=码 ~2048（钳 2047 → 读极冷，一眼可辨）；短路=码→0（钳 1 → 读极热） */
 static float ntc_to_celsius(uint16_t code)
 {
   float c = (float)code;
   if (c < 1.0f) c = 1.0f;
-  float r = NTC_R_FIXED * (4096.0f / c - 2.0f);
+  if (c > 2047.0f) c = 2047.0f;
+  float r = NTC_R_FIXED * c / (4096.0f - 2.0f * c);
   return 1.0f / (1.0f / NTC_T25_K + logf(r / NTC_R25) / NTC_BETA) - 273.15f;
 }
 
@@ -448,7 +602,28 @@ static void adc2_read(void)
 {
   if (HAL_ADC_Start(&hadc2) != HAL_OK) return;
   if (HAL_ADC_PollForConversion(&hadc2, 2) == HAL_OK)
-    adc2_ntc = (uint16_t)HAL_ADC_GetValue(&hadc2);
+  {
+    /* NTC 3 帧中值滤波（09-05 晚加）：NTC 引线随电机线束与相线并行，PWM 边沿
+     * 容性耦合踢出 ±400 count 双向单帧毛刺（实测单帧乱跳 2.5~41.8°C），中值对
+     * 单帧离群免疫；150ms 窗对秒级热时间常数零畸变。PWR 在板上远离相线无此症 */
+    static uint16_t ntc_hist[3];
+    static uint8_t ntc_pos = 0, ntc_primed = 0;
+    uint16_t raw = (uint16_t)HAL_ADC_GetValue(&hadc2);
+    if (!ntc_primed)
+    {
+      ntc_hist[0] = ntc_hist[1] = ntc_hist[2] = raw;
+      ntc_primed = 1;
+    }
+    else
+    {
+      ntc_hist[ntc_pos] = raw;
+      ntc_pos = (uint8_t)((ntc_pos + 1u) % 3u);
+    }
+    uint16_t a = ntc_hist[0], b = ntc_hist[1], c3 = ntc_hist[2];
+    uint16_t lo = (a < b) ? a : b;
+    uint16_t hi = (a < b) ? b : a;
+    adc2_ntc = (c3 < lo) ? lo : ((c3 > hi) ? hi : c3);   /* clamp(c3)∈[lo,hi] = 中值 */
+  }
   if (HAL_ADC_PollForConversion(&hadc2, 2) == HAL_OK)
     adc2_pwr = (uint16_t)HAL_ADC_GetValue(&hadc2);
 }
