@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "mimosa-hook-status/v1",
+  "recordedAt": "2026-09-18T15:36:35.981Z",
+  "sessionId": "sess_dec4f826-67a0-4b46-9e92-bbc43d208299",
+  "event": "PostToolUse",
+  "toolName": "Edit",
+  "file": "/home/wjt/.zcode/cli/memories/projects/motor_driver-328755ca508b3de9/memory/MEMORY.md",
+  "outcome": "clear",
+  "coverage": "complete",
+  "findingCount": 0,
+  "durationMs": 3,
+  "hostState": "hook_complete",
+  "reportHint": ".mimosa/reports/"
+}
