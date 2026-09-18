@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os2.h"
 #include "adc.h"
 #include "fdcan.h"
 #include "gpdma.h"
@@ -81,6 +82,7 @@ static const char *cal_name[4] = { "none", "busy", "FAIL", "OK" };
 void SystemClock_Config(void);
 void PeriphCommonClock_Config(void);
 static void MPU_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -314,6 +316,16 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim3);
 #endif
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+  /* Call init function for freertos objects (in app_freertos.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */

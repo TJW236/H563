@@ -1,3 +1,5 @@
 # CubeIDE 构建产物（makefile 由 .cproject 重新生成）
 Debug/
 Release/
+# Mimosa 钩子运行态（误入库，09-19 清出）
+.mimosa/

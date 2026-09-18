@@ -218,7 +218,10 @@ void TIM3_IRQHandler(void)
 void TIM7_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM7_IRQn 0 */
-
+  /* HAL 时基分派（2026-09-19 恢复：CubeMX NVIC"生成处理器"标志被翻掉后此调用从生成区
+   * 消失→HAL_GetTick 冻结=全砖；放进 USER CODE 永久防丢。⚠ 若在 CubeMX NVIC 里重新
+   * 勾回"生成处理器"会与生成区调用重复——保持现状别勾） */
+  HAL_TIM_IRQHandler(&htim7);
   /* USER CODE END TIM7_IRQn 0 */
   /* USER CODE BEGIN TIM7_IRQn 1 */
 
@@ -231,7 +234,9 @@ void TIM7_IRQHandler(void)
 void USART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART1_IRQn 0 */
-
+  /* UART 分派（2026-09-19 恢复，缘由同 TIM7：丢=串口零接收+中断风暴。⚠ 同上别在
+   * CubeMX NVIC 里勾回"生成处理器"） */
+  HAL_UART_IRQHandler(&huart1);
   /* USER CODE END USART1_IRQn 0 */
   /* USER CODE BEGIN USART1_IRQn 1 */
 
