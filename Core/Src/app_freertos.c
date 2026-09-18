@@ -347,9 +347,9 @@ void StartTask02(void *argument)
       int elen = 0;
       if (!cmd_ok)
       {
-        /* 整行拒收：原文回显（拼接的幽灵字节一起示众），不进任何命令分支 */
-        elen = snprintf(ebuf, sizeof(ebuf), "[%c] REJECT: %s\r\n",
-                        uart_cmd_buf[0] ? uart_cmd_buf[0] : '?',
+        /* 整行拒收：原文回显（拼接的幽灵字节一起示众），不进任何命令分支。
+         * 格式与原版逐字一致（logs/0917 事故现场为证）：前缀=字面量 [cmd] */
+        elen = snprintf(ebuf, sizeof(ebuf), "[cmd] REJECT: %s\r\n",
                         (const char *)uart_cmd_buf);
       }
       else if (uart_cmd_buf[0] == 'q')
