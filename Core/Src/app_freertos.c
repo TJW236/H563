@@ -30,6 +30,7 @@
 #include "foc.h"
 #include "drv8320s.h"
 #include "adc.h"
+#include "fdcan.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,6 +61,8 @@ extern volatile uint32_t foc_dt_last;      /* main.c：GPDMA0 ISR 耗时统计�
 extern volatile uint32_t foc_dt_max;
 extern volatile uint64_t foc_dt_sum;
 extern volatile uint32_t foc_dt_n;
+volatile uint8_t ntc_trip = 0;   /* OTP 过温跳闸锁扣（本文件 UartTXTask 50ms 判温写 1/解除写 0；
+                                  * fdcan.c RX ISR 读——CAN 控制帧跳闸期间拒收，与 UART s/p 同规） */
 #if 0 /* ---- v6 拖动自校准监控状态停用（恢复时随 SpeedObserveTask 一起启用）----
 static volatile struct {
   int32_t  rpm;
@@ -155,10 +158,13 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN defaultTask */
-  /* 心跳灯：500ms 翻转。不依赖串口/SPI——亮 = 调度器活着 */
+  /* 心跳灯：500ms 翻转。不依赖串口/SPI——亮 = 调度器活着。
+   * CAN 心跳帧（0x300+MOTOR_ID，state=1）同环发送：2Hz bring-up 档（G431 正式版 10Hz，
+   * 上主控联调时再提频——defaultTask 届时改成 100ms 翻转 LED / 每 5 拍发一帧） */
   for(;;)
   {
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    FDCAN_SendHeartbeat(MOTOR_ID, CAN_STATE_OPERATIONAL);
     osDelay(500);
   }
   /* USER CODE END defaultTask */
@@ -223,8 +229,7 @@ void StartTask02(void *argument)
   uint8_t div = 0;
   uint32_t rate_prev_tick = 0, rate_prev_scan = 0;   /* ADC 速率守卫基准（首轮只记录） */
   uint8_t rate_armed = 0;
-  uint8_t ntc_trip = 0;   /* 过温跳闸锁扣：1=iq_ref 已强制 0 且 q/s/z/v 被拒（50ms 拍判温） */
-  uint8_t ntc_open = 0;   /* NTC 开路锁存（读 < -30°C）：不复位不解除，断电才恢复 */
+  uint8_t ntc_open = 0;   /* NTC 开路锁存（读 < -30°C）：不复位不解除，断电才恢复（ntc_trip 已提为文件级 volatile 供 CAN ISR 读） */
   float grav_m = 0.0f, grav_l = 0.0f;   /* 重力前馈参数：负载质量 kg / 力臂 m（m、l 命令写） */
   for(;;)
   {

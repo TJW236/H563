@@ -75,7 +75,8 @@ void Error_Handler(void);
 #define Z_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+/* CAN 节点号（照 G431 惯例：1~4 电机，0=IMU 预留；烧多板时改此处再编译） */
+#define MOTOR_ID 1
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

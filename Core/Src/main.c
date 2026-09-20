@@ -141,6 +141,14 @@ int main(void)
   /* USER CODE BEGIN 2 */
   static const char banner[] = "\r\n=== H563 step9: pos loop (tim3/4 1071hz, pi 54/0 max800rpm, cmd p=OutShaftRad, csv col9/10=pos mrad); speed 0.034/0.035@4285hz; base: rcr1 30kHz, pi_iq 0.22/228, ENC_DIR=-1; ntc otp70 ===\r\n";
   HAL_UART_Transmit(&huart1, (uint8_t *)banner, sizeof(banner) - 1, 100);
+  {
+    /* CAN 应用层就绪标志（fdcan.c 初始化已完成——含过滤器+Start+RX 中断） */
+    char b[72];
+    int len = snprintf(b, sizeof(b), "[can] fd-brs 1M/2M id=%u hb=500ms filt=000-184\r\n",
+                       (unsigned)MOTOR_ID);
+    if (len > 0)
+      HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)len, 20);
+  }
 
   /* DWT CYCCNT 使能（测量 GPDMA0 ISR 耗时，t 命令读数）：Cortex-M33 调试单元
    * 自由运行周期计数器，无需调试器连接，TRCENA 使能即计数；若读数恒 0

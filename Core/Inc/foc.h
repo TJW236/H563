@@ -172,6 +172,10 @@ extern volatile uint8_t grav_on;      /* 1=开启（g 命令）；上电默认 0
 extern volatile float grav_amp;       /* 前馈幅度（A）= m·l·9.8/(GEAR_RATIO×KT_NATIVE)，命令侧换算 */
 float FOC_GravityFF(void);            /* 本拍前馈电流（无状态：相位实时取 total_cnt） */
 
+/* OTP 过温跳闸锁扣（定义在 app_freertos.c：UartTXTask 50ms 判温写；
+ * fdcan.c CAN RX ISR 读——CAN 速度/位置控制帧跳闸期间拒收，与 UART s/p 同规） */
+extern volatile uint8_t ntc_trip;
+
 /* 一圈输出轴的里程表 count 数（65536×8=2^19）。int32 溢出点 2^31=4096×2^19 恰为
  * 其整数倍 → 相位跨溢出连续，单向连转 4096 输出圈无需任何处理 */
 #define GRAV_CNT_PER_OUT_REV  (65536L * 8L)
