@@ -292,5 +292,23 @@ void FDCAN_SendError(uint8_t motor_id, uint32_t err_code)
     (void)HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &header, data);
 }
 
+/* ==================== Bus-Off 自愈（500ms 任务侧看护）====================
+ * 陷阱（G431 在案坑）：总线上无节点应答（CANable 未接/断电）时 TX 无 ACK，
+ * AutoRetransmission 无限重传 → TEC 爬满 255 → Bus_Off 静默且不自动恢复——
+ * 之后接上总线也没心跳，必须断电重上电。看护：PSR.BO 置位则 Stop+Start
+ * 重新走 init→normal 序列（TEC 清零）；总线恢复后 ≤500ms 回来。
+ * 纯任务上下文调用，不碰 ISR；Stop 期间 RX/TX 硬件停住无竞态 */
+void FDCAN_BusOffWatch(void)
+{
+    FDCAN_ProtocolStatusTypeDef ps;
+    if (HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps) != HAL_OK)
+        return;
+    if (ps.BusOff)
+    {
+        (void)HAL_FDCAN_Stop(&hfdcan1);
+        (void)HAL_FDCAN_Start(&hfdcan1);
+    }
+}
+
 /* USER CODE END 1 */
 

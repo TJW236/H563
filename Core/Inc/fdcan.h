@@ -81,6 +81,7 @@ void MX_FDCAN1_Init(void);
 void FDCAN_SendStatus(uint8_t motor_id, float speed_rpm);
 void FDCAN_SendHeartbeat(uint8_t motor_id, uint8_t state);
 void FDCAN_SendError(uint8_t motor_id, uint32_t err_code);
+void FDCAN_BusOffWatch(void);   /* 500ms 任务侧看护：Bus_Off 自愈（Stop+Start，TEC 清零） */
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

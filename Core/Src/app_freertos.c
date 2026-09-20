@@ -633,6 +633,7 @@ void StartTask02(void *argument)
       rate_armed = 1;
       rate_prev_tick = now_tick;
       rate_prev_scan = now_scan;
+      FDCAN_BusOffWatch();   /* 500ms：总线上无节点时 TX 无 ACK → Bus_Off 静默不自愈，此处恢复 */
       uint8_t nf = (uint8_t)HAL_GPIO_ReadPin(nfault_GPIO_Port, nfault_Pin);
       uint16_t f0 = DRV8320S_ReadReg(0x00);
       uint16_t f1 = DRV8320S_ReadReg(0x01);
