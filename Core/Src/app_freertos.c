@@ -407,6 +407,9 @@ void StartTask02(void *argument)
            * 大步进=位置 P 饱和 ±800 恒速 slew；到位纯 P 保持（有限刚度，G431 同款） */
           g_foc.pi_speed.integral1 = shadow_iq_ref;
           pos_target = val * GEAR_RATIO;
+          g_foc.pi_pos.max = POS_SPEED_LIMIT;   /* 恢复默认 800（09-20）：CAN 位置帧会把
+                                                 * 上限动态改小（含 0=禁输出），UART 入口回文档值，
+                                                 * 防 CAN→UART 跨入口污染 */
           pos_mode = 1;
           speed_mode = 1;
           elen = snprintf(ebuf, sizeof(ebuf), "p=%d mrad(out)\r\n", (int)(val * 1000.0f));

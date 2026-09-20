@@ -200,6 +200,11 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     {
         if (ntc_trip)   /* OTP 跳闸期间拒收控制帧（与 UART s 同规；ntc_trip 任务侧 50ms 判温 */
             return;
+        /* DLC 防护（2026-09-20 加固）：短帧时 data[] 尾部是 ISR 栈未初始化字节，memcpy
+         * 出任意 float——NaN 有 isfinite 兜底，有限值垃圾最坏被限幅成 ±800 满速。
+         * 协议定义 DLC=8，不足 4 字节整帧丢弃 */
+        if (rx_header.DataLength < FDCAN_DLC_BYTES_4)
+            return;
         /* 速度控制帧：NaN/Inf（上位机 bug/未初始化内存）强制清零绕过 PI 防积分爆炸；限幅 ±800 */
         float spd;
         memcpy(&spd, data, 4);
@@ -214,6 +219,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     else if (id == (CAN_ID_POSITION_BASE + MOTOR_ID))
     {
         if (ntc_trip)
+            return;
+        /* DLC 防护（同上）：位置帧需 pos+max_spd 共 8 字节，不足整帧丢 */
+        if (rx_header.DataLength < FDCAN_DLC_BYTES_8)
             return;
         /* 位置控制帧：pos 输出轴 rad ×GEAR_RATIO 入电机轴误差域（kp=54 直拷前提）；
          * max_spd 动态改位置环输出上限（0=禁止输出；上限恢复默认 800 走 p/位置帧带非零值） */
